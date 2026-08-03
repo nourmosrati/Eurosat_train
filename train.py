@@ -5,13 +5,15 @@ Fine-tune a Vision Transformer (ViT) on EuroSAT for Land Cover Classification
 
 Fixes applied vs original:
   1. Removed deprecated `from torch.cuda.amp import GradScaler, autocast` import
-  2. GradScaler() → torch.amp.GradScaler('cuda')
-  3. autocast(device_type=...) → torch.amp.autocast('cuda') — compatible with
+  2. GradScaler() -> torch.amp.GradScaler('cuda')
+  3. autocast(device_type=...) -> torch.amp.autocast('cuda') - compatible with
      both older and newer PyTorch (2.x) on Windows
-  4. total_mem → total_memory  (CUDA device properties attribute name)
+  4. total_mem -> total_memory  (CUDA device properties attribute name)
   5. evaluate() autocast also fixed (was causing crash on val loop)
   6. CPU fallback: autocast disabled gracefully when no CUDA available
   7. Added missing GradScaler / autocast imports guard at top
+  8. NEW: auto batch-size probe finds the largest safe batch_size for your
+     GPU before training starts, instead of a hardcoded guess.
 
 Runs on: RTX 3050 6 GB (local), Kaggle T4 16 GB, Colab T4 15 GB
 """
@@ -52,12 +54,19 @@ class Config:
     train_ratio: float = 0.70
     val_ratio: float = 0.15
 
-    epochs: int = 20
-    batch_size: int = 16
+    epochs: int = 10
+    batch_size: int = 16          # overwritten by auto batch-size probe at runtime
     accum_steps: int = 4
-    lr: float = 3e-4
+    target_effective_batch: int = 64   # batch_size * accum_steps, kept roughly constant
+    lr: float = 1e-2          # tuned via lr.py sweep (was 3e-4 default)
     weight_decay: float = 1e-2
-    num_workers: int = 2
+    num_workers: int = 2     # persistent_workers=True means train/val/test loaders
+                               # each keep this many processes alive simultaneously —
+                               # 16 caused ~32-48 total processes (each re-importing
+                               # torch/sklearn/scipy/matplotlib) to exhaust the Windows
+                               # paging file. 6 is a safer level; raise cautiously.
+    persistent_workers: bool = True   # keep worker processes alive between epochs
+    prefetch_factor: int = 4          # each worker preloads 4 batches ahead
 
     img_size: int = 224
     imagenet_mean = (0.485, 0.456, 0.406)
@@ -87,12 +96,12 @@ def seed_everything(seed: int) -> None:
 
 
 # ============================================================================
-# 2. AMP HELPERS  ← FIX: unified autocast + scaler that works on any PyTorch 2.x
+# 2. AMP HELPERS
 # ============================================================================
 
 def make_scaler(device: torch.device) -> torch.amp.GradScaler:
     """
-    FIX 1 & 2: Use torch.amp.GradScaler (not torch.cuda.amp.GradScaler).
+    Use torch.amp.GradScaler (not torch.cuda.amp.GradScaler).
     Disabled automatically when running on CPU so no crash without GPU.
     """
     return torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
@@ -100,7 +109,7 @@ def make_scaler(device: torch.device) -> torch.amp.GradScaler:
 
 def autocast_ctx(device: torch.device):
     """
-    FIX 3: Use torch.amp.autocast with the device string.
+    Use torch.amp.autocast with the device string.
     Falls back to a no-op context manager on CPU.
     """
     if device.type == 'cuda':
@@ -162,20 +171,29 @@ def get_dataloaders():
 
     print(f"[DATA] Train: {len(train_idx)}  Val: {len(val_idx)}  Test: {len(test_idx)}")
 
+    # persistent_workers/prefetch_factor only apply when num_workers > 0
+    loader_kwargs = {}
+    if cfg.num_workers > 0:
+        loader_kwargs["persistent_workers"] = cfg.persistent_workers
+        loader_kwargs["prefetch_factor"] = cfg.prefetch_factor
+
     train_loader = DataLoader(
         Subset(full_train_ds, train_idx),
         batch_size=cfg.batch_size, shuffle=True,
         num_workers=cfg.num_workers, pin_memory=True, drop_last=True,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         Subset(full_eval_ds, val_idx),
         batch_size=cfg.batch_size, shuffle=False,
         num_workers=cfg.num_workers, pin_memory=True,
+        **loader_kwargs,
     )
     test_loader = DataLoader(
         Subset(full_eval_ds, test_idx),
         batch_size=cfg.batch_size, shuffle=False,
         num_workers=cfg.num_workers, pin_memory=True,
+        **loader_kwargs,
     )
     return train_loader, val_loader, test_loader
 
@@ -191,7 +209,7 @@ def build_model(device: torch.device) -> nn.Module:
         num_classes=cfg.num_classes,
     )
 
-    # Freeze backbone — only the classification head will be trained
+    # Freeze backbone - only the classification head will be trained
     for name, param in model.named_parameters():
         if "head" not in name:
             param.requires_grad = False
@@ -210,6 +228,60 @@ def build_model(device: torch.device) -> nn.Module:
 
 
 # ============================================================================
+# 5b. AUTO BATCH SIZE PROBE
+# ============================================================================
+
+def find_max_batch_size(model, device, candidates=(8, 16, 24, 32, 48, 64, 96), safety_margin=0.85):
+    """
+    Probes increasing batch sizes with dummy data to find the largest one
+    that fits in VRAM, then backs off by `safety_margin` to leave headroom
+    for optimizer states and real data loading (which this probe doesn't
+    fully replicate, since AdamW keeps extra momentum buffers per parameter).
+
+    Only meaningful on CUDA - on CPU, just returns the smallest candidate.
+    """
+    if device.type != "cuda":
+        print("[BATCH PROBE] No CUDA device - skipping probe, using smallest candidate.")
+        return candidates[0]
+
+    model.train()
+    working_bs = candidates[0]
+
+    for bs in candidates:
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+
+            x = torch.randn(bs, 3, cfg.img_size, cfg.img_size, device=device)
+            y = torch.randint(0, cfg.num_classes, (bs,), device=device)
+
+            with autocast_ctx(device):
+                logits = model(x)
+                loss = nn.functional.cross_entropy(logits, y)
+            loss.backward()
+
+            peak_gb = torch.cuda.max_memory_allocated() / 1024**3
+            print(f"[BATCH PROBE] batch_size={bs:>3}  ->  OK, peak VRAM: {peak_gb:.2f} GB")
+            working_bs = bs
+            model.zero_grad(set_to_none=True)
+
+        except torch.cuda.OutOfMemoryError:
+            print(f"[BATCH PROBE] batch_size={bs:>3}  ->  OUT OF MEMORY, stopping search")
+            torch.cuda.empty_cache()
+            break
+
+    safe_bs = max(1, int(working_bs * safety_margin))
+    print(f"[BATCH PROBE] Largest working batch size: {working_bs}")
+    print(f"[BATCH PROBE] Using {int(safety_margin*100)}% safety margin -> batch_size = {safe_bs}")
+
+    # Reset any state the probe's dummy forward/backward passes may have left behind
+    model.zero_grad(set_to_none=True)
+    torch.cuda.empty_cache()
+
+    return safe_bs
+
+
+# ============================================================================
 # 6. TRAINING LOOP
 # ============================================================================
 
@@ -225,7 +297,6 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, scaler, devi
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        # FIX 3: use our helper so autocast works on any PyTorch 2.x build
         with autocast_ctx(device):
             logits = model(images)
             loss   = criterion(logits, labels) / cfg.accum_steps
@@ -265,7 +336,6 @@ def evaluate(model, loader, criterion, device):
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        # FIX 5: val loop uses same fixed autocast helper
         with autocast_ctx(device):
             logits = model(images)
             loss   = criterion(logits, labels)
@@ -310,7 +380,7 @@ def full_test_evaluation(model, test_loader, device):
         yticklabels=CLASS_NAMES,
         xlabel="Predicted",
         ylabel="True",
-        title=f"Confusion Matrix — Acc: {test_acc*100:.1f}%  F1: {macro_f1:.4f}",
+        title=f"Confusion Matrix - Acc: {test_acc*100:.1f}%  F1: {macro_f1:.4f}",
     )
     plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
 
@@ -341,17 +411,23 @@ def main():
     print(f"[DEVICE] {device}", end="")
     if device.type == "cuda":
         props = torch.cuda.get_device_properties(0)
-        # FIX 4: total_mem → total_memory
-        print(f"  —  {torch.cuda.get_device_name(0)}  "
+        print(f"  -  {torch.cuda.get_device_name(0)}  "
               f"({props.total_memory / 1024**3:.1f} GB)")
     else:
-        print("  ⚠  No GPU detected; training will be slow.")
+        print("  [!] No GPU detected; training will be slow.")
 
-    # ---- Data ----
-    train_loader, val_loader, test_loader = get_dataloaders()
-
-    # ---- Model ----
+    # ---- Model (built first, since the batch probe needs it) ----
     model = build_model(device)
+
+    # ---- Auto batch size probe ----
+    cfg.batch_size = find_max_batch_size(model, device)
+    cfg.accum_steps = max(1, round(cfg.target_effective_batch / cfg.batch_size))
+    effective_batch = cfg.batch_size * cfg.accum_steps
+    print(f"[CONFIG] batch_size={cfg.batch_size}  accum_steps={cfg.accum_steps}  "
+          f"effective_batch={effective_batch}\n")
+
+    # ---- Data (built AFTER probe, since it needs the final cfg.batch_size) ----
+    train_loader, val_loader, test_loader = get_dataloaders()
 
     # ---- Loss / Optimizer / Scheduler ----
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
@@ -366,7 +442,6 @@ def main():
         optimizer, T_max=cfg.epochs, eta_min=1e-6
     )
 
-    # FIX 1 & 2: use torch.amp.GradScaler (not deprecated torch.cuda.amp version)
     scaler = make_scaler(device)
 
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
@@ -378,7 +453,7 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"Starting training for {cfg.epochs} epochs")
-    print(f"Effective batch size: {cfg.batch_size} × {cfg.accum_steps} = "
+    print(f"Effective batch size: {cfg.batch_size} x {cfg.accum_steps} = "
           f"{cfg.batch_size * cfg.accum_steps}")
     print(f"{'='*60}\n")
 
@@ -394,11 +469,11 @@ def main():
         lr_now  = scheduler.get_last_lr()[0]
 
         print(
-            f"Epoch {epoch:02d}/{cfg.epochs}  │  "
-            f"train_loss: {train_loss:.4f}  │  "
-            f"val_loss: {val_loss:.4f}  │  "
-            f"val_acc: {val_acc:.4f}  │  "
-            f"lr: {lr_now:.2e}  │  "
+            f"Epoch {epoch:02d}/{cfg.epochs}  |  "
+            f"train_loss: {train_loss:.4f}  |  "
+            f"val_loss: {val_loss:.4f}  |  "
+            f"val_acc: {val_acc:.4f}  |  "
+            f"lr: {lr_now:.2e}  |  "
             f"time: {elapsed:.1f}s"
         )
 
@@ -410,7 +485,7 @@ def main():
             best_val_acc   = val_acc
             best_model_wts = copy.deepcopy(model.state_dict())
             torch.save(best_model_wts, cfg.best_model_path)
-            print(f"  ↑ New best val_acc: {best_val_acc:.4f}  — checkpoint saved")
+            print(f"  ^ New best val_acc: {best_val_acc:.4f}  - checkpoint saved")
 
     print(f"\n{'='*60}")
     print(f"Training complete.  Best val accuracy: {best_val_acc:.4f}")
@@ -436,7 +511,7 @@ def main():
     plt.close(fig)
 
     # ---- Test evaluation ----
-    print("\nLoading best checkpoint for test evaluation …")
+    print("\nLoading best checkpoint for test evaluation ...")
     model.load_state_dict(
         torch.load(cfg.best_model_path, map_location=device, weights_only=True)
     )

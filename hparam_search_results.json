@@ -1,0 +1,20 @@
+[
+  {
+    "lr": 0.03,
+    "weight_decay": 0.01,
+    "best_val_acc": 0.9649382716049383,
+    "diverged": false
+  },
+  {
+    "lr": 0.01,
+    "weight_decay": 0.01,
+    "best_val_acc": 0.9637037037037037,
+    "diverged": false
+  },
+  {
+    "lr": 0.003,
+    "weight_decay": 0.01,
+    "best_val_acc": 0.9619753086419753,
+    "diverged": false
+  }
+]

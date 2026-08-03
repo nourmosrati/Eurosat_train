@@ -13,6 +13,7 @@ OptimizedModule layer, which left stage2_best.pth / stage3_best.pth with stray
 unfreeze_blocks() and run_stage().
 
 NEW dependency for the multispectral path: pip install datasets
+
 (Hugging Face `datasets`, used to pull giswqs/EuroSAT_MS — the 13-band release
 of EuroSAT, same 10 classes / same class order as the RGB version.)
 
