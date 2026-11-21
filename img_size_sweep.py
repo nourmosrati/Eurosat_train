@@ -33,9 +33,9 @@ SEED = 42
 MODEL_NAME = "vit_large_patch16_224"  # winner from the model_name sweep (val_acc=0.9696)
 NUM_CLASSES = 10
 PRETRAINED = True
-TRAIN_RATIO = 0.70  # placeholder -- update once your train/val ratio sweep finishes
-VAL_RATIO = 0.15  # placeholder -- update once your train/val ratio sweep finishes
-EPOCHS = 10
+TRAIN_RATIO = 0.80  # winner from the train/val ratio sweep (val_acc=0.9741, new best overall)
+VAL_RATIO = 0.10  # winner from the train/val ratio sweep (val_acc=0.9741, new best overall)
+EPOCHS = 10  # kept at 10, not the confirmed epochs=20 winner -- at ~15min/epoch (batch=32), 4 img_size candidates x 20 epochs could run ~20h+, worse at 336px which costs more per step. This sweep only needs to RANK candidates; rerun the winning img_size at epochs=20 afterward for the final precise number.
 LR = 3e-2  # winner from the lr sweep
 WEIGHT_DECAY = 5e-2  # winner from the weight_decay sweep (val_acc=0.9699, tiebreak on lower val_loss + still-improving trend)
 TARGET_EFFECTIVE_BATCH = 32  # winner from the target_effective_batch sweep (val_acc=0.9716)
@@ -46,7 +46,7 @@ DATA_ROOT = "./data"
 # ----------------------------
 # img_size values to sweep -- must all be multiples of patch size 16
 # ----------------------------
-IMG_SIZE_VALUES = [ 336]
+IMG_SIZE_VALUES = [112, 160, 224, 336]
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -317,4 +317,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
