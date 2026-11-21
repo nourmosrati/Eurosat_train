@@ -313,7 +313,8 @@ def main():
     with open("model_name_sweep_results.json", "w") as f:
         json.dump(results, f, indent=2)
 
-    if best_state_overall is not None:
+    if best_state_overall is not None:]'and'
+    ''
         torch.save(best_state_overall, "best_model_name_sweep_head.pth")
 
     print("\n=== Summary ===")
